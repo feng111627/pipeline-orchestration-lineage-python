@@ -48,15 +48,18 @@ class TestDependencyFailurePropagation:
         assert run.status == RunStatus.FAILED
         assert run.step_runs["a"].status == StepStatus.SUCCEEDED
         assert run.step_runs["b"].status == StepStatus.FAILED
-        # 直接与间接受影响步骤都被拒绝执行
+        # 直接下游被失败直接拖累；更下游为间接连累，两类原因必须可区分
         assert run.step_runs["c"].status == StepStatus.SKIPPED_UPSTREAM_FAILED
-        assert run.step_runs["d"].status == StepStatus.SKIPPED_UPSTREAM_FAILED
+        assert run.step_runs["d"].status == StepStatus.SKIPPED_TRANSITIVE
 
     def test_skip_reason_is_distinguishable(self, dag_service):
         run = dag_service.trigger("dag", "k-fail-2")
-        # 拒绝原因可区分：上游失败 ≠ 取消
+        # 拒绝原因可区分：直接上游失败 / 更上游连累 / 取消，三者互不混淆
         assert run.step_runs["c"].status != StepStatus.SKIPPED_CANCELLED
-        assert "b=FAILED" in (run.step_runs["c"].error or "")
+        assert run.step_runs["c"].status != StepStatus.SKIPPED_TRANSITIVE
+        assert "直接上游步骤失败" in (run.step_runs["c"].error or "")
+        assert run.step_runs["d"].status == StepStatus.SKIPPED_TRANSITIVE
+        assert "间接" in (run.step_runs["d"].error or "")
 
     def test_failed_step_has_no_side_effects(self, dag_service):
         dag_service.trigger("dag", "k-fail-3")

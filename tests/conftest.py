@@ -22,6 +22,13 @@ BUSINESS_AREAS = {
     "TestCancellationConsistency": "取消一致性：运行停在一致状态、无半生效中间态",
     "TestInvalidTransitions": "非法状态流转：明确拒绝而非静默覆盖",
     "TestInvalidDefinitions": "非法定义校验：依赖环/未知依赖/重名/自依赖均被拒绝",
+    "TestResumeReusesSuccessfulSteps": "定点续跑：沿用旧结果、按源版本续跑、源运行只读不改",
+    "TestResumeFailurePropagation": "续跑失败传播：再次失败下游被拒且三类原因可区分",
+    "TestResumeRejected": "非法续跑拒绝：未结束/全成功/被活动运行占用均明确拒绝",
+    "TestConcurrentDuplicateResume": "并发与重复续跑：幂等返回同一运行、无重复执行副作用",
+    "TestResumeCancellation": "续跑取消：停在一致状态、沿用保留、未开始步骤取消跳过",
+    "TestResumeLineageTraceability": "跨运行追溯：沿用血缘标注来源、复现交代续跑链",
+    "TestResumeApiParity": "续跑接口：HTTP 发起续跑与直接调用结论一致、拒绝可识别",
 }
 
 

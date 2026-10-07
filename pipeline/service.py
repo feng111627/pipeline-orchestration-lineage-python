@@ -42,6 +42,10 @@ class PipelineService:
         version = self._registry.latest(pipeline_name)
         return self._orchestrator.trigger(version, idempotency_key)
 
+    def resume(self, source_run_id: str, idempotency_key: str) -> Run:
+        """定点续跑：沿用源运行成功结果，按源运行当时的版本只重跑未成功部分。"""
+        return self._orchestrator.resume(source_run_id, idempotency_key)
+
     def cancel(self, run_id: str) -> Run:
         return self._orchestrator.cancel(run_id)
 

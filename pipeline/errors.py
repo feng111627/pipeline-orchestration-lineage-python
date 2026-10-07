@@ -23,3 +23,7 @@ class ConflictError(PipelineError):
 
 class InvalidTransitionError(PipelineError):
     """非法状态流转（如取消已结束的运行、重复终态化）。"""
+
+
+class ResumeNotPossibleError(PipelineError):
+    """续跑请求被明确拒绝：源运行未结束、已全部成功或没有可续跑步骤。"""

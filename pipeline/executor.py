@@ -1,11 +1,18 @@
-"""编排执行器：按依赖顺序推进、失败传播、取消与并发/幂等控制。
+"""编排执行器：按依赖顺序推进、失败传播、取消与并发/幂等控制、定点续跑。
 
 一致性规则：
 - 同一管道同一时刻只允许一个活动运行（PENDING/RUNNING）。
-- 相同幂等键的重复提交返回既有运行，不产生第二次执行。
+- 相同幂等键的重复提交（含续跑）返回既有运行，不产生第二次执行。
 - 步骤的副作用（输出 + 血缘）只在步骤成功后、同一把锁内一次性生效，
   失败步骤零副作用，不存在"执行到一半已生效"的中间态。
 - 所有状态流转经过校验，非法流转抛 InvalidTransitionError。
+
+定点续跑（resume）：
+- 只能基于"已结束且确有未成功步骤"的历史运行发起；续跑本身是一次全新运行，
+  照样受单活动运行、幂等键与取消规则约束。
+- 沿用源运行当时已成功步骤的输出（标记 reused，不重新执行、无重复副作用），
+  只重跑失败步骤及当时未执行的下游；定义/配置一律采用源运行的版本快照。
+- 源运行记录与血缘只读不改，新运行的血缘只追加，并标注沿用来源。
 """
 
 from __future__ import annotations
@@ -15,10 +22,12 @@ import time
 import uuid
 from typing import Any, Callable
 
-from .errors import ConflictError, InvalidTransitionError, NotFoundError
+from .errors import (ConflictError, InvalidTransitionError, NotFoundError,
+                     ResumeNotPossibleError)
 from .lineage import LineageService
 from .models import (Run, RunStatus, StepRun, StepStatus, PipelineVersion,
-                     TERMINAL_RUN_STATUSES, run_from_dict, run_to_dict)
+                     TERMINAL_RUN_STATUSES, definition_from_dict,
+                     definition_to_dict, run_from_dict, run_to_dict)
 from .registry import topo_order
 from .store import JsonStore
 
@@ -32,7 +41,9 @@ _ALLOWED_RUN_TRANSITIONS = {
     RunStatus.RUNNING: {RunStatus.SUCCEEDED, RunStatus.FAILED, RunStatus.CANCELLED},
 }
 _ALLOWED_STEP_TRANSITIONS = {
-    StepStatus.PENDING: {StepStatus.RUNNING, StepStatus.SKIPPED_UPSTREAM_FAILED,
+    StepStatus.PENDING: {StepStatus.RUNNING, StepStatus.SUCCEEDED,
+                         StepStatus.SKIPPED_UPSTREAM_FAILED,
+                         StepStatus.SKIPPED_TRANSITIVE,
                          StepStatus.SKIPPED_CANCELLED},
     StepStatus.RUNNING: {StepStatus.SUCCEEDED, StepStatus.FAILED},
 }
@@ -107,6 +118,112 @@ class Orchestrator:
             self._set_cancel_event(run.run_id, None)
         return self.get_run(run.run_id)
 
+    def resume(self, source_run_id: str, idempotency_key: str) -> Run:
+        """基于一次已结束、且确有未成功步骤的历史运行发起定点续跑。
+
+        - 源运行必须处于终态；已全部成功或没有可续跑步骤：ResumeNotPossibleError。
+        - 续跑是一次全新运行：受单活动运行、幂等键与取消规则约束，
+          并在 resumed_from_run_id 中交代来源。
+        - 定义/配置完全采用源运行快照（不挑最新版本）；源运行只读不改。
+        - 源运行已成功的步骤沿用旧输出（reused=True，不执行、无副作用），
+          并在同一把锁内为新运行追加标注了来源的血缘记录。
+        """
+        with self._store.lock:
+            source_row = self._store.find_one(_RUNS, run_id=source_run_id)
+            if source_row is None:
+                raise NotFoundError(f"源运行 {source_run_id} 不存在，无法续跑")
+            source = run_from_dict(source_row)
+
+            dup = self._store.find_one(
+                _RUNS, pipeline_name=source.pipeline_name,
+                idempotency_key=idempotency_key)
+            if dup is not None:
+                return run_from_dict(dup)  # 幂等命中：重复续跑无副作用
+
+            if source.status not in TERMINAL_RUN_STATUSES:
+                raise ResumeNotPossibleError(
+                    f"源运行 {source_run_id} 尚未结束（{source.status.value}），"
+                    "不能续跑")
+            if source.status == RunStatus.SUCCEEDED:
+                raise ResumeNotPossibleError(
+                    f"源运行 {source_run_id} 已全部成功，无需续跑")
+
+            order = topo_order(source.definition_snapshot)
+            # 可续跑步骤 = 快照中当时未成功的步骤；缺记录视为未成功
+            rerunnable = [
+                name for name in order
+                if (sr := source.step_runs.get(name)) is None
+                or sr.status != StepStatus.SUCCEEDED
+            ]
+            if not rerunnable:
+                raise ResumeNotPossibleError(
+                    f"源运行 {source_run_id} 没有可续跑的步骤")
+
+            for row in self._store.find(_RUNS,
+                                        pipeline_name=source.pipeline_name):
+                if RunStatus(row["status"]) not in TERMINAL_RUN_STATUSES:
+                    raise ConflictError(
+                        f"管道 {source.pipeline_name} 已有活动运行 "
+                        f"{row['run_id']}，不能发起续跑")
+
+            # 冻结源运行版本：深拷贝快照，续跑与当前定义/最新版本完全无关
+            frozen = definition_from_dict(definition_to_dict(
+                source.definition_snapshot))
+            configs = {s.name: dict(s.config) for s in frozen.steps}
+
+            run = Run(
+                run_id=uuid.uuid4().hex,
+                pipeline_name=source.pipeline_name,
+                pipeline_version=source.pipeline_version,
+                idempotency_key=idempotency_key,
+                definition_snapshot=frozen,
+                created_at=time.time(),
+                resumed_from_run_id=source_run_id,
+            )
+            for step_def in frozen.steps:
+                prev = source.step_runs.get(step_def.name)
+                if prev is not None and prev.status == StepStatus.SUCCEEDED:
+                    # 沿用：直接进入 SUCCEEDED（PENDING→SUCCEEDED 仅用于沿用），
+                    # 旧输出原样交给下游，不执行 handler，不产生重复副作用。
+                    sr = StepRun(
+                        step_name=step_def.name,
+                        status=StepStatus.SUCCEEDED,
+                        started_at=prev.started_at,
+                        finished_at=prev.finished_at,
+                        outputs=dict(prev.outputs),
+                        reused=True,
+                    )
+                    _check_transition(_ALLOWED_STEP_TRANSITIONS,
+                                      StepStatus.PENDING, StepStatus.SUCCEEDED,
+                                      "沿用步骤")
+                else:
+                    sr = StepRun(step_name=step_def.name)  # 待重跑
+                run.step_runs[step_def.name] = sr
+
+            self._store.append(_RUNS, run_to_dict(run))
+
+            # 沿用步骤的血缘在锁内一次性播种：新运行血缘只追加，源血缘不改
+            if self._lineage is not None:
+                for step_def in frozen.steps:
+                    sr = run.step_runs[step_def.name]
+                    if sr.reused:
+                        inputs = {
+                            dep: dict(run.step_runs[dep].outputs)
+                            for dep in step_def.depends_on
+                        }
+                        self._lineage.record_step(
+                            run, step_def.name, inputs, sr.outputs,
+                            configs[step_def.name],
+                            reused_from_run_id=source_run_id)
+
+        self._set_cancel_event(run.run_id, threading.Event())
+        try:
+            self._transition_run(run, RunStatus.RUNNING)
+            self._execute(run)
+        finally:
+            self._set_cancel_event(run.run_id, None)
+        return self.get_run(run.run_id)
+
     def cancel(self, run_id: str) -> Run:
         """取消活动运行；已结束或不存在的运行抛错。"""
         run = self.get_run(run_id)
@@ -155,13 +272,27 @@ class Orchestrator:
                 self._transition_run(run, RunStatus.CANCELLED)
                 self._persist(run)
                 return
+            # 沿用步骤：已在创建时沿用旧结果，直接放行，不重新执行
+            if sr.status == StepStatus.SUCCEEDED:
+                continue
             upstream = [run.step_runs[d] for d in deps[name]]
             if any(u.status != StepStatus.SUCCEEDED for u in upstream):
-                # 失败传播：给出可区分的拒绝原因
-                self._transition_step(sr, StepStatus.SKIPPED_UPSTREAM_FAILED)
-                sr.error = "上游步骤未成功: " + ",".join(
-                    f"{u.step_name}={u.status.value}" for u in upstream
-                    if u.status != StepStatus.SUCCEEDED)
+                # 失败传播，三类拒绝原因必须可区分：
+                # - 直接上游存在 FAILED：直接被失败拖累
+                # - 直接上游没有 FAILED（即它自己也是被跳过）：更上游的间接连累
+                # - 取消：由上方取消分支统一标记 SKIPPED_CANCELLED
+                direct = [u for u in upstream if u.status == StepStatus.FAILED]
+                if direct:
+                    self._transition_step(
+                        sr, StepStatus.SKIPPED_UPSTREAM_FAILED)
+                    sr.error = "直接上游步骤失败: " + ",".join(
+                        u.step_name for u in direct)
+                else:
+                    self._transition_step(
+                        sr, StepStatus.SKIPPED_TRANSITIVE)
+                    sr.error = "更上游步骤未成功，间接受连累: " + ",".join(
+                        f"{u.step_name}={u.status.value}" for u in upstream
+                        if u.status != StepStatus.SUCCEEDED)
                 self._persist(run)
                 continue
             inputs = {u.step_name: dict(u.outputs) for u in upstream}

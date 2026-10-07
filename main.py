@@ -14,7 +14,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from pipeline.errors import (ConflictError, InvalidTransitionError,
-                             NotFoundError, PipelineError, ValidationError)
+                             NotFoundError, PipelineError,
+                             ResumeNotPossibleError, ValidationError)
 from pipeline.models import (PipelineDefinition, StepDefinition,
                              run_to_dict, version_to_dict)
 from pipeline.service import PipelineService
@@ -62,6 +63,12 @@ def _bad_transition(_, exc: InvalidTransitionError):
     raise HTTPException(status_code=409, detail=str(exc))
 
 
+@app.exception_handler(ResumeNotPossibleError)
+def _no_resume(_, exc: ResumeNotPossibleError):
+    # 源运行未结束/已全部成功/无可续跑步骤：是明确的业务拒绝，而非空运行
+    raise HTTPException(status_code=409, detail=str(exc))
+
+
 @app.exception_handler(ValidationError)
 def _invalid(_, exc: ValidationError):
     raise HTTPException(status_code=422, detail=str(exc))
@@ -102,6 +109,12 @@ def trigger(name: str, body: TriggerIn):
 @app.post("/runs/{run_id}/cancel")
 def cancel(run_id: str):
     return run_to_dict(service.cancel(run_id))
+
+
+@app.post("/runs/{run_id}/resume", status_code=201)
+def resume(run_id: str, body: TriggerIn):
+    # 续跑按源运行当时的定义/配置版本进行，结论与直接调用 service.resume 一致
+    return run_to_dict(service.resume(run_id, body.idempotency_key))
 
 
 @app.get("/runs/{run_id}")

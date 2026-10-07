@@ -24,7 +24,8 @@ class LineageService:
 
     def record_step(self, run: Run, step_name: str,
                     inputs: dict[str, Any], outputs: dict[str, Any],
-                    step_config: dict[str, Any]) -> LineageRecord:
+                    step_config: dict[str, Any],
+                    reused_from_run_id: str | None = None) -> LineageRecord:
         record = LineageRecord(
             run_id=run.run_id,
             pipeline_name=run.pipeline_name,
@@ -34,6 +35,7 @@ class LineageService:
             outputs=dict(outputs),
             step_config=dict(step_config),
             recorded_at=time.time(),
+            reused_from_run_id=reused_from_run_id,
         )
         self._store.append(_COLLECTION, lineage_to_dict(record))
         return record
@@ -64,6 +66,7 @@ class LineageService:
                 "status": sr.status.value,
                 "error": sr.error,
                 "outputs": dict(sr.outputs),
+                "reused": sr.reused,  # True=沿用历史结果，本次未重算
             }
             rec = lineage.get(sr.step_name)
             if sr.status == StepStatus.SUCCEEDED:
@@ -75,6 +78,7 @@ class LineageService:
                     "outputs": dict(rec.outputs),
                     "step_config": dict(rec.step_config),
                     "pipeline_version": rec.pipeline_version,
+                    "reused_from_run_id": rec.reused_from_run_id,
                 }
             steps.append(entry)
         return {
@@ -87,6 +91,8 @@ class LineageService:
                 "created_at": run.created_at,
                 "started_at": run.started_at,
                 "finished_at": run.finished_at,
+                # None=全新触发；否则交代本次运行从哪次历史运行接续
+                "resumed_from_run_id": run.resumed_from_run_id,
             },
             "steps": steps,
         }
