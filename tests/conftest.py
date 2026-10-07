@@ -22,6 +22,12 @@ BUSINESS_AREAS = {
     "TestCancellationConsistency": "取消一致性：运行停在一致状态、无半生效中间态",
     "TestInvalidTransitions": "非法状态流转：明确拒绝而非静默覆盖",
     "TestInvalidDefinitions": "非法定义校验：依赖环/未知依赖/重名/自依赖均被拒绝",
+    "TestResumeFromFailure": "定点续跑：沿用已成功步骤旧结果，只重跑失败与受连累步骤",
+    "TestResumeVersionPinning": "续跑版本锚定：配置变更/改名/回滚后仍按源运行版本快照续跑",
+    "TestResumeFailureAndCancel": "续跑异常：再次失败三分类拒绝传播、续跑取消停在一致状态",
+    "TestInvalidResume": "非法续跑：全成功/不存在/未结束的运行明确拒绝",
+    "TestConcurrentResume": "并发与重复续跑：同键幂等、异键单活动运行、无重复副作用",
+    "TestResumeApi": "续跑服务接口：HTTP 入口与直接调用结论一致",
 }
 
 

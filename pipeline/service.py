@@ -42,6 +42,10 @@ class PipelineService:
         version = self._registry.latest(pipeline_name)
         return self._orchestrator.trigger(version, idempotency_key)
 
+    def resume(self, run_id: str, idempotency_key: str) -> Run:
+        """从已结束且有未成功步骤的历史运行续跑（按原版本快照）。"""
+        return self._orchestrator.resume(run_id, idempotency_key)
+
     def cancel(self, run_id: str) -> Run:
         return self._orchestrator.cancel(run_id)
 

@@ -99,6 +99,11 @@ def trigger(name: str, body: TriggerIn):
     return run_to_dict(service.trigger(name, body.idempotency_key))
 
 
+@app.post("/runs/{run_id}/resume", status_code=201)
+def resume(run_id: str, body: TriggerIn):
+    return run_to_dict(service.resume(run_id, body.idempotency_key))
+
+
 @app.post("/runs/{run_id}/cancel")
 def cancel(run_id: str):
     return run_to_dict(service.cancel(run_id))

@@ -16,7 +16,8 @@ class StepStatus(str, enum.Enum):
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
-    SKIPPED_UPSTREAM_FAILED = "SKIPPED_UPSTREAM_FAILED"  # 上游失败导致的拒绝执行
+    SKIPPED_UPSTREAM_FAILED = "SKIPPED_UPSTREAM_FAILED"  # 直接上游失败导致的拒绝执行
+    SKIPPED_UPSTREAM_SKIPPED = "SKIPPED_UPSTREAM_SKIPPED"  # 直接上游本身被拒绝（更上游连累）
     SKIPPED_CANCELLED = "SKIPPED_CANCELLED"              # 运行取消导致的拒绝执行
 
 
@@ -66,6 +67,8 @@ class StepRun:
     finished_at: float | None = None
     error: str | None = None
     outputs: dict[str, Any] = field(default_factory=dict)
+    # 续跑沿用：该步骤结果来自哪次历史运行；None 表示本次运行亲自计算
+    origin_run_id: str | None = None
 
 
 @dataclass
@@ -82,6 +85,8 @@ class Run:
     created_at: float = 0.0
     started_at: float | None = None
     finished_at: float | None = None
+    # 续跑来源：本次运行从哪次历史运行接续；None 表示全新触发
+    resumed_from_run_id: str | None = None
 
 
 @dataclass
@@ -96,6 +101,8 @@ class LineageRecord:
     outputs: dict[str, Any] = field(default_factory=dict)
     step_config: dict[str, Any] = field(default_factory=dict)
     recorded_at: float = 0.0
+    # 续跑沿用：该记录誊自哪次历史运行的血缘；None 表示本次运行亲自计算
+    carried_from_run_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -140,14 +147,16 @@ def version_from_dict(d: dict[str, Any]) -> PipelineVersion:
 def step_run_to_dict(s: StepRun) -> dict[str, Any]:
     return {"step_name": s.step_name, "status": s.status.value,
             "started_at": s.started_at, "finished_at": s.finished_at,
-            "error": s.error, "outputs": dict(s.outputs)}
+            "error": s.error, "outputs": dict(s.outputs),
+            "origin_run_id": s.origin_run_id}
 
 
 def step_run_from_dict(d: dict[str, Any]) -> StepRun:
     return StepRun(step_name=d["step_name"], status=StepStatus(d["status"]),
                    started_at=d.get("started_at"),
                    finished_at=d.get("finished_at"),
-                   error=d.get("error"), outputs=dict(d.get("outputs", {})))
+                   error=d.get("error"), outputs=dict(d.get("outputs", {})),
+                   origin_run_id=d.get("origin_run_id"))
 
 
 def run_to_dict(r: Run) -> dict[str, Any]:
@@ -158,7 +167,8 @@ def run_to_dict(r: Run) -> dict[str, Any]:
             "status": r.status.value,
             "step_runs": {k: step_run_to_dict(v) for k, v in r.step_runs.items()},
             "created_at": r.created_at, "started_at": r.started_at,
-            "finished_at": r.finished_at}
+            "finished_at": r.finished_at,
+            "resumed_from_run_id": r.resumed_from_run_id}
 
 
 def run_from_dict(d: dict[str, Any]) -> Run:
@@ -171,14 +181,16 @@ def run_from_dict(d: dict[str, Any]) -> Run:
                           for k, v in d.get("step_runs", {}).items()},
                created_at=d.get("created_at", 0.0),
                started_at=d.get("started_at"),
-               finished_at=d.get("finished_at"))
+               finished_at=d.get("finished_at"),
+               resumed_from_run_id=d.get("resumed_from_run_id"))
 
 
 def lineage_to_dict(l: LineageRecord) -> dict[str, Any]:
     return {"run_id": l.run_id, "pipeline_name": l.pipeline_name,
             "pipeline_version": l.pipeline_version, "step_name": l.step_name,
             "inputs": dict(l.inputs), "outputs": dict(l.outputs),
-            "step_config": dict(l.step_config), "recorded_at": l.recorded_at}
+            "step_config": dict(l.step_config), "recorded_at": l.recorded_at,
+            "carried_from_run_id": l.carried_from_run_id}
 
 
 def lineage_from_dict(d: dict[str, Any]) -> LineageRecord:
@@ -187,4 +199,5 @@ def lineage_from_dict(d: dict[str, Any]) -> LineageRecord:
                          step_name=d["step_name"], inputs=dict(d.get("inputs", {})),
                          outputs=dict(d.get("outputs", {})),
                          step_config=dict(d.get("step_config", {})),
-                         recorded_at=d.get("recorded_at", 0.0))
+                         recorded_at=d.get("recorded_at", 0.0),
+                         carried_from_run_id=d.get("carried_from_run_id"))

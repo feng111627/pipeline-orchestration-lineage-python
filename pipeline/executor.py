@@ -15,10 +15,12 @@ import time
 import uuid
 from typing import Any, Callable
 
-from .errors import ConflictError, InvalidTransitionError, NotFoundError
+from .errors import (ConflictError, InvalidTransitionError, NotFoundError,
+                     ValidationError)
 from .lineage import LineageService
 from .models import (Run, RunStatus, StepRun, StepStatus, PipelineVersion,
-                     TERMINAL_RUN_STATUSES, run_from_dict, run_to_dict)
+                     TERMINAL_RUN_STATUSES, definition_from_dict,
+                     definition_to_dict, run_from_dict, run_to_dict)
 from .registry import topo_order
 from .store import JsonStore
 
@@ -33,6 +35,7 @@ _ALLOWED_RUN_TRANSITIONS = {
 }
 _ALLOWED_STEP_TRANSITIONS = {
     StepStatus.PENDING: {StepStatus.RUNNING, StepStatus.SKIPPED_UPSTREAM_FAILED,
+                         StepStatus.SKIPPED_UPSTREAM_SKIPPED,
                          StepStatus.SKIPPED_CANCELLED},
     StepStatus.RUNNING: {StepStatus.SUCCEEDED, StepStatus.FAILED},
 }
@@ -107,6 +110,67 @@ class Orchestrator:
             self._set_cancel_event(run.run_id, None)
         return self.get_run(run.run_id)
 
+    def resume(self, source_run_id: str, idempotency_key: str) -> Run:
+        """从一次已结束且存在未成功步骤的历史运行发起续跑（全新运行）。
+
+        - 沿用源运行的定义快照与版本（不用当前最新版本），源运行记录不被修改。
+        - 源运行中已成功的步骤不重算：其输出与血缘誊入新运行并标注来源，
+          直接作为下游输入；失败/被拒/未跑的步骤重置为 PENDING 重新执行。
+        - 与 trigger 同样受单活动运行与幂等键约束：同键重复续跑返回既有运行。
+        """
+        with self._store.lock:
+            source = self.get_run(source_run_id)  # 不存在抛 NotFoundError
+            dup = self._store.find_one(_RUNS, pipeline_name=source.pipeline_name,
+                                       idempotency_key=idempotency_key)
+            if dup is not None:
+                return run_from_dict(dup)  # 幂等命中：不重复执行
+            if source.status not in TERMINAL_RUN_STATUSES:
+                raise ConflictError(
+                    f"源运行 {source_run_id} 尚未结束（{source.status.value}），不能续跑")
+            for row in self._store.find(_RUNS, pipeline_name=source.pipeline_name):
+                if RunStatus(row["status"]) not in TERMINAL_RUN_STATUSES:
+                    raise ConflictError(
+                        f"管道 {source.pipeline_name} 已有活动运行 {row['run_id']}")
+            carried = [s.name for s in source.definition_snapshot.steps
+                       if source.step_runs[s.name].status == StepStatus.SUCCEEDED]
+            if len(carried) == len(source.definition_snapshot.steps):
+                raise ValidationError(
+                    f"运行 {source_run_id} 全部步骤已成功，没有可续跑的步骤")
+            # 深拷贝源运行快照：续跑严格按当时版本执行，与当前定义无关
+            snapshot = definition_from_dict(
+                definition_to_dict(source.definition_snapshot))
+            step_runs: dict[str, StepRun] = {}
+            for s in snapshot.steps:
+                src = source.step_runs[s.name]
+                if src.status == StepStatus.SUCCEEDED:
+                    step_runs[s.name] = StepRun(
+                        step_name=s.name, status=StepStatus.SUCCEEDED,
+                        started_at=src.started_at, finished_at=src.finished_at,
+                        outputs=dict(src.outputs), origin_run_id=source.run_id)
+                else:
+                    step_runs[s.name] = StepRun(step_name=s.name)
+            run = Run(
+                run_id=uuid.uuid4().hex,
+                pipeline_name=source.pipeline_name,
+                pipeline_version=source.pipeline_version,
+                idempotency_key=idempotency_key,
+                definition_snapshot=snapshot,
+                created_at=time.time(),
+                step_runs=step_runs,
+                resumed_from_run_id=source.run_id,
+            )
+            # 运行记录与沿用血缘在同一把锁内一次性落盘，源运行不被触碰
+            self._store.append(_RUNS, run_to_dict(run))
+            if self._lineage is not None:
+                self._lineage.carry_forward(run, source, carried)
+        self._set_cancel_event(run.run_id, threading.Event())
+        try:
+            self._transition_run(run, RunStatus.RUNNING)
+            self._execute(run)
+        finally:
+            self._set_cancel_event(run.run_id, None)
+        return self.get_run(run.run_id)
+
     def cancel(self, run_id: str) -> Run:
         """取消活动运行；已结束或不存在的运行抛错。"""
         run = self.get_run(run_id)
@@ -149,6 +213,8 @@ class Orchestrator:
 
         for name in order:
             sr = run.step_runs[name]
+            if sr.status == StepStatus.SUCCEEDED:
+                continue  # 续跑沿用的步骤：直接作为上游输入，不再执行
             if self._cancel_requested(run.run_id):
                 self._skip_remaining(run, order, name,
                                      StepStatus.SKIPPED_CANCELLED)
@@ -156,12 +222,16 @@ class Orchestrator:
                 self._persist(run)
                 return
             upstream = [run.step_runs[d] for d in deps[name]]
-            if any(u.status != StepStatus.SUCCEEDED for u in upstream):
-                # 失败传播：给出可区分的拒绝原因
-                self._transition_step(sr, StepStatus.SKIPPED_UPSTREAM_FAILED)
+            bad = [u for u in upstream if u.status != StepStatus.SUCCEEDED]
+            if bad:
+                # 失败传播：区分"直接上游失败"与"更上游连累"两种拒绝原因
+                if any(u.status == StepStatus.FAILED for u in bad):
+                    skip_status = StepStatus.SKIPPED_UPSTREAM_FAILED
+                else:
+                    skip_status = StepStatus.SKIPPED_UPSTREAM_SKIPPED
+                self._transition_step(sr, skip_status)
                 sr.error = "上游步骤未成功: " + ",".join(
-                    f"{u.step_name}={u.status.value}" for u in upstream
-                    if u.status != StepStatus.SUCCEEDED)
+                    f"{u.step_name}={u.status.value}" for u in bad)
                 self._persist(run)
                 continue
             inputs = {u.step_name: dict(u.outputs) for u in upstream}
